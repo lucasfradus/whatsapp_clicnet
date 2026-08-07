@@ -1,0 +1,19 @@
+{
+  "name": "clic-whatsapp-sender",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Manda los avisos internos de Clicnet a los grupos de WhatsApp de cada sede",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "whatsapp-web.js": "^1.26.0"
+  }
+}
