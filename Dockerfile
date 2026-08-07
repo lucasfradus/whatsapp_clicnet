@@ -20,7 +20,8 @@ RUN npm install --omit=dev
 
 COPY src ./src
 
-# Montar acá el volumen de Railway. Sin volumen, cada deploy pide QR de nuevo.
-VOLUME ["/data"]
+# Nada de `VOLUME /data` acá: Railway rechaza el build si el Dockerfile declara
+# volúmenes ("use Railway Volumes"). El volumen se monta del lado de Railway, y
+# es obligatorio: sin él, cada deploy pierde la sesión y pide QR de nuevo.
 
 CMD ["node", "src/index.js"]
