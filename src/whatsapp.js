@@ -1,3 +1,4 @@
+import fs from "node:fs/promises"
 import path from "node:path"
 import pkg from "whatsapp-web.js"
 import QRCode from "qrcode"
@@ -29,7 +30,42 @@ export function numeroConectado() {
   return numero
 }
 
+/**
+ * Borra los locks que Chromium deja en el perfil.
+ *
+ * El perfil vive en el volumen, así que el `SingletonLock` del contenedor
+ * anterior sobrevive al reinicio. Chromium lo ve, cree que hay otra instancia
+ * usando el perfil ("appears to be in use by another Chromium process ... on
+ * another computer") y se niega a arrancar — el servicio queda muerto para
+ * siempre después del primer redeploy.
+ *
+ * Como corremos con UNA sola réplica, un lock encontrado al arrancar es siempre
+ * de un contenedor que ya no existe. Se puede borrar sin miedo.
+ */
+async function limpiarLocksDeChromium(dir) {
+  const LOCKS = new Set(["SingletonLock", "SingletonCookie", "SingletonSocket"])
+  let entradas
+  try {
+    entradas = await fs.readdir(dir, { withFileTypes: true })
+  } catch {
+    return // el perfil todavía no existe: primer arranque
+  }
+
+  for (const entrada of entradas) {
+    const completo = path.join(dir, entrada.name)
+    if (LOCKS.has(entrada.name)) {
+      // Son symlinks colgados, por eso `rm` y no `unlink` a secas.
+      await fs.rm(completo, { force: true }).catch(() => {})
+      console.log(`[whatsapp] lock viejo borrado: ${completo}`)
+    } else if (entrada.isDirectory()) {
+      await limpiarLocksDeChromium(completo)
+    }
+  }
+}
+
 export async function iniciarWhatsapp() {
+  await limpiarLocksDeChromium(config.dataPath)
+
   cliente = new Client({
     authStrategy: new LocalAuth({ dataPath: path.join(config.dataPath, "sesion") }),
     puppeteer: {
