@@ -34,6 +34,9 @@ let numero = null
  */
 const grupos = new Map()
 
+/** Para loguear el fallo de getChats() una vez y no en cada latido. */
+let getChatsRoto = false
+
 export function estaConectado() {
   return conectado
 }
@@ -143,24 +146,54 @@ export async function mandarMensaje(chatId, texto) {
   await cliente.sendMessage(chatId, texto)
 }
 
-/** Anota el grupo del que vino un mensaje. Nunca tira: es un side effect. */
+/**
+ * Intenta el nombre real del grupo por las tres vías que expone la librería.
+ * Todas pegan contra el mismo Store de WhatsApp Web, así que suelen romperse
+ * juntas — pero cuando WhatsApp lo arregle, esto empieza a andar solo.
+ */
+async function nombreDelGrupo(msg, jid) {
+  try {
+    const chat = await msg.getChat()
+    if (chat?.name) return chat.name
+    // groupMetadata.subject es el nombre "crudo" del grupo: a veces está
+    // aunque `name` venga vacío.
+    if (chat?.groupMetadata?.subject) return chat.groupMetadata.subject
+  } catch { /* seguimos probando */ }
+
+  try {
+    const chat = await cliente.getChatById(jid)
+    if (chat?.name) return chat.name
+    if (chat?.groupMetadata?.subject) return chat.groupMetadata.subject
+  } catch { /* nos quedamos sin nombre */ }
+
+  return null
+}
+
+/**
+ * Anota el grupo del que vino un mensaje. Nunca tira: es un side effect.
+ *
+ * Además del nombre (que puede no venir), guarda una PISTA: qué se escribió y
+ * quién. Es lo que hace usable el selector cuando WhatsApp no da los nombres —
+ * seis "1203636...@g.us" son indistinguibles, pero "«tortugas» — Lucas" no.
+ * Se actualiza con cada mensaje: escribir en el grupo alcanza para reconocerlo.
+ */
 async function registrarGrupoDelMensaje(msg) {
   try {
     const jid = msg?.from ?? ""
     if (!jid.endsWith("@g.us")) return
-    if (grupos.has(jid)) return
 
-    // El nombre es lindo de tener pero no es el dato: si `getChat()` también
-    // está roto, guardamos el grupo igual con el JID como etiqueta. En Clicnet
-    // se le puede poner el nombre que quieran.
-    let nombre = jid
-    try {
-      const chat = await msg.getChat()
-      if (chat?.name) nombre = chat.name
-    } catch { /* nos quedamos con el JID */ }
+    const previo = grupos.get(jid)
+    const nombre = previo?.nombre ?? (await nombreDelGrupo(msg, jid))
 
-    grupos.set(jid, nombre)
-    console.log(`[whatsapp] grupo descubierto: ${nombre} (${jid})`)
+    const cuerpo = (msg?.body ?? "").trim().replace(/\s+/g, " ").slice(0, 40)
+    const quien = msg?._data?.notifyName ?? null
+    const pista = cuerpo ? (quien ? `«${cuerpo}» — ${quien}` : `«${cuerpo}»`) : (previo?.pista ?? null)
+
+    grupos.set(jid, { nombre, pista })
+
+    if (!previo) {
+      console.log(`[whatsapp] grupo descubierto: ${nombre ?? jid}${pista ? ` · ${pista}` : ""}`)
+    }
   } catch (error) {
     console.error("[whatsapp] no se pudo registrar el grupo:", error.message)
   }
@@ -179,13 +212,28 @@ export async function listarGrupos() {
   try {
     const chats = await cliente.getChats()
     for (const chat of chats) {
-      if (chat.isGroup) grupos.set(chat.id._serialized, chat.name ?? chat.id._serialized)
+      if (!chat.isGroup) continue
+      const jid = chat.id._serialized
+      const previo = grupos.get(jid)
+      grupos.set(jid, { nombre: chat.name ?? previo?.nombre ?? null, pista: previo?.pista ?? null })
+    }
+    if (getChatsRoto) {
+      console.log("[whatsapp] getChats() volvió a funcionar")
+      getChatsRoto = false
     }
   } catch (error) {
-    // El stack importa: el `message` de estos errores viene minificado ("r") y
-    // no dice nada sobre qué parte del Store se rompió.
-    console.error("[whatsapp] getChats() falló, uso solo los grupos vistos por mensajes:", error.stack ?? error)
+    // Una vez y no en cada latido: esto falla cada 60s durante meses, y un log
+    // que siempre tiene el mismo error es un log que nadie mira. El stack va
+    // completo porque el `message` viene minificado ("r") y no dice nada.
+    if (!getChatsRoto) {
+      getChatsRoto = true
+      console.error(
+        "[whatsapp] getChats() falló; de acá en más los grupos salen sólo de los mensajes recibidos. " +
+          "No se vuelve a loguear hasta que funcione:",
+        error.stack ?? error
+      )
+    }
   }
 
-  return [...grupos].map(([id, nombre]) => ({ id, nombre }))
+  return [...grupos].map(([id, { nombre, pista }]) => ({ id, nombre: nombre ?? id, pista }))
 }
