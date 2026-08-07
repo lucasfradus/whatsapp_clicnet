@@ -49,10 +49,15 @@ los mensajes quedan `PENDIENTE` y salen cuando vuelve. Por eso el sender
 
 ## Deploy en Railway
 
+Ya está deployado en el proyecto **Clic Net**, entorno `production`, como el
+servicio **WhatsApp Sender** (al lado de Clicnet y su Postgres).
+
 Tres cosas que no son opcionales:
 
 1. **Volumen montado en `/data`.** Sin volumen, cada deploy pierde la sesión y
-   pide QR de nuevo.
+   pide QR de nuevo. El Dockerfile **no** puede declararlo: Railway rechaza el
+   build si encuentra un `VOLUME` (`use Railway Volumes`). Se crea del lado de
+   Railway — por CLI es `railway volume -p <proj> -e <env> -s <svc> add -m /data`.
 2. **Una sola réplica.** La sesión de whatsapp-web.js es un lock de archivo: dos
    instancias sobre el mismo volumen se pisan y desloguean el número.
 3. **`SENDER_TOKEN` igual en los dos lados.** Generalo con

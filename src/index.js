@@ -77,14 +77,22 @@ async function heartbeat() {
   }
 }
 
-/** Healthcheck para Railway. No expone nada más. */
+/**
+ * Healthcheck para Railway. Responde 200 con que el PROCESO está vivo, no con
+ * que WhatsApp esté vinculado.
+ *
+ * La diferencia importa: si devolviera 503 sin sesión, Railway mataría y
+ * reiniciaría el contenedor en loop, y nunca habría chance de escanear el QR
+ * — hace falta que el servicio esté corriendo para publicarlo. El estado real
+ * de la sesión se ve en Clicnet, que es donde alguien lo va a mirar.
+ */
 function levantarHealthcheck() {
   const puerto = Number(process.env.PORT) || 3000
   http
     .createServer((req, res) => {
       if (req.url === "/health") {
-        res.writeHead(estaConectado() ? 200 : 503, { "Content-Type": "application/json" })
-        res.end(JSON.stringify({ conectado: estaConectado(), numero: numeroConectado() }))
+        res.writeHead(200, { "Content-Type": "application/json" })
+        res.end(JSON.stringify({ vivo: true, conectado: estaConectado(), numero: numeroConectado() }))
         return
       }
       res.writeHead(404)

@@ -29,6 +29,19 @@ async function pedir(ruta, opciones = {}) {
       return null
     }
 
+    // Chequear el content-type antes de parsear: si el endpoint todavía no
+    // existe (o hay un proxy en el medio), lo que vuelve es una página HTML con
+    // status 200 y `.json()` explota con un "Unexpected token '<'" que no dice
+    // nada. Mejor un mensaje que se entienda.
+    const tipo = respuesta.headers.get("content-type") ?? ""
+    if (!tipo.includes("application/json")) {
+      console.error(
+        `[clicnet] ${ruta} devolvió ${tipo || "sin content-type"} en vez de JSON ` +
+          `— ¿está deployada la versión de Clicnet con los endpoints del sender?`
+      )
+      return null
+    }
+
     return await respuesta.json()
   } catch (error) {
     console.error(`[clicnet] ${ruta} falló:`, error.message)
