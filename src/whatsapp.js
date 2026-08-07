@@ -22,6 +22,18 @@ let cliente = null
 let conectado = false
 let numero = null
 
+/**
+ * Grupos conocidos, por JID.
+ *
+ * Se llena por dos vías porque ninguna sola alcanza:
+ *  - `getChats()`, que es la completa pero se rompe seguido (whatsapp-web.js
+ *    consulta el Store interno de WhatsApp Web, y cada actualización de WhatsApp
+ *    puede dejarla tirando un error minificado tipo "r").
+ *  - los mensajes que llegan, que es la vía confiable: si el número está en el
+ *    grupo, ve los mensajes. Alcanza con que alguien escriba una vez.
+ */
+const grupos = new Map()
+
 export function estaConectado() {
   return conectado
 }
@@ -103,6 +115,11 @@ export async function iniciarWhatsapp() {
     console.log("[whatsapp] sesión autenticada")
   })
 
+  // Cualquier mensaje de un grupo nos da su JID. `message_create` incluye los
+  // propios, así que escribir en el grupo desde el mismo celular también sirve.
+  cliente.on("message_create", (msg) => void registrarGrupoDelMensaje(msg))
+  cliente.on("message", (msg) => void registrarGrupoDelMensaje(msg))
+
   cliente.on("auth_failure", (mensaje) => {
     conectado = false
     console.error("[whatsapp] falló la autenticación:", mensaje)
@@ -126,19 +143,49 @@ export async function mandarMensaje(chatId, texto) {
   await cliente.sendMessage(chatId, texto)
 }
 
+/** Anota el grupo del que vino un mensaje. Nunca tira: es un side effect. */
+async function registrarGrupoDelMensaje(msg) {
+  try {
+    const jid = msg?.from ?? ""
+    if (!jid.endsWith("@g.us")) return
+    if (grupos.has(jid)) return
+
+    // El nombre es lindo de tener pero no es el dato: si `getChat()` también
+    // está roto, guardamos el grupo igual con el JID como etiqueta. En Clicnet
+    // se le puede poner el nombre que quieran.
+    let nombre = jid
+    try {
+      const chat = await msg.getChat()
+      if (chat?.name) nombre = chat.name
+    } catch { /* nos quedamos con el JID */ }
+
+    grupos.set(jid, nombre)
+    console.log(`[whatsapp] grupo descubierto: ${nombre} (${jid})`)
+  } catch (error) {
+    console.error("[whatsapp] no se pudo registrar el grupo:", error.message)
+  }
+}
+
 /**
  * Grupos donde está el número, para que Clicnet arme el selector de destinos.
- * Devuelve [] si todavía no cargó: no es un error, es que recién arranca.
+ *
+ * Intenta `getChats()` y suma lo que haya visto por mensajes. Si `getChats()`
+ * falla —pasa seguido— igual devolvemos los descubiertos, que para el caso de
+ * uso alcanzan: son los grupos donde alguien ya escribió.
  */
 export async function listarGrupos() {
   if (!cliente || !conectado) return []
+
   try {
     const chats = await cliente.getChats()
-    return chats
-      .filter((c) => c.isGroup)
-      .map((c) => ({ id: c.id._serialized, nombre: c.name ?? "(sin nombre)" }))
+    for (const chat of chats) {
+      if (chat.isGroup) grupos.set(chat.id._serialized, chat.name ?? chat.id._serialized)
+    }
   } catch (error) {
-    console.error("[whatsapp] no se pudieron listar los grupos:", error.message)
-    return []
+    // El stack importa: el `message` de estos errores viene minificado ("r") y
+    // no dice nada sobre qué parte del Store se rompió.
+    console.error("[whatsapp] getChats() falló, uso solo los grupos vistos por mensajes:", error.stack ?? error)
   }
+
+  return [...grupos].map(([id, nombre]) => ({ id, nombre }))
 }
