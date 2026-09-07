@@ -25,6 +25,30 @@ const dormir = (ms) => new Promise((r) => setTimeout(r, ms))
 
 let procesando = false
 
+const arrancadoEn = Date.now()
+
+/**
+ * Sale del proceso cada tanto para que Railway levante uno nuevo.
+ *
+ * Chromium pierde memoria y Railway factura el promedio por minuto, así que un
+ * proceso viejo es literalmente más caro que uno nuevo. Salimos con 0: es una
+ * terminación buscada, no un fallo, y el `restartPolicyType: ALWAYS` del
+ * railway.json es lo que hace que Railway lo levante igual.
+ *
+ * Se llama sólo cuando la cola vino vacía, que es el único momento en que no hay
+ * nada en vuelo. Si Clicnet no contestó, la cola también se ve vacía y podemos
+ * reciclar de más — no importa: Clicnet es el dueño de la cola, los mensajes
+ * quedan PENDIENTE y salen apenas volvemos.
+ */
+function reciclarSiCorresponde() {
+  const vividoMs = Date.now() - arrancadoEn
+  if (vividoMs < config.reciclarCadaMs) return
+
+  const horas = (vividoMs / 3_600_000).toFixed(1)
+  console.log(`[sender] reciclando tras ${horas}h con la cola vacía; Railway levanta un proceso nuevo`)
+  process.exit(0)
+}
+
 async function procesarCola() {
   // El poll y el envío no son atómicos: si un lote tarda más que el intervalo,
   // el tick siguiente traería los MISMOS mensajes (Clicnet no los marca al
@@ -33,36 +57,43 @@ async function procesarCola() {
   if (!estaConectado()) return
 
   procesando = true
+  let colaVacia = false
   try {
     const mensajes = await traerCola()
-    if (mensajes.length === 0) return
+    if (mensajes.length === 0) {
+      // Ojo: `return` acá adentro haría que el reciclado del final nunca corra,
+      // porque el `return` gana sobre el código que sigue al try/finally.
+      colaVacia = true
+    } else {
+      console.log(`[cola] ${mensajes.length} mensaje(s) para mandar`)
+      const resultados = []
 
-    console.log(`[cola] ${mensajes.length} mensaje(s) para mandar`)
-    const resultados = []
+      for (const [indice, mensaje] of mensajes.entries()) {
+        if (indice > 0) await dormir(config.delayEnvioMs)
 
-    for (const [indice, mensaje] of mensajes.entries()) {
-      if (indice > 0) await dormir(config.delayEnvioMs)
+        try {
+          await mandarMensaje(mensaje.chatId, mensaje.texto)
+          resultados.push({ id: mensaje.id, ok: true })
+          console.log(`[cola] #${mensaje.id} → ${mensaje.chatId}`)
+        } catch (error) {
+          resultados.push({ id: mensaje.id, ok: false, error: error.message })
+          console.error(`[cola] #${mensaje.id} falló:`, error.message)
 
-      try {
-        await mandarMensaje(mensaje.chatId, mensaje.texto)
-        resultados.push({ id: mensaje.id, ok: true })
-        console.log(`[cola] #${mensaje.id} → ${mensaje.chatId}`)
-      } catch (error) {
-        resultados.push({ id: mensaje.id, ok: false, error: error.message })
-        console.error(`[cola] #${mensaje.id} falló:`, error.message)
-
-        // Si se cayó la sesión, cortamos el lote: el resto se reintenta cuando
-        // vuelva. Seguir sería quemar los 3 intentos de cada mensaje al pedo.
-        if (!estaConectado()) break
+          // Si se cayó la sesión, cortamos el lote: el resto se reintenta cuando
+          // vuelva. Seguir sería quemar los 3 intentos de cada mensaje al pedo.
+          if (!estaConectado()) break
+        }
       }
-    }
 
-    await reportarResultados(resultados)
+      await reportarResultados(resultados)
+    }
   } catch (error) {
     console.error("[cola] error inesperado:", error.message)
   } finally {
     procesando = false
   }
+
+  if (colaVacia) reciclarSiCorresponde()
 }
 
 async function heartbeat() {
