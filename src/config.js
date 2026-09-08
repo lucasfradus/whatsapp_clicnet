@@ -38,35 +38,33 @@ export const config = {
   /**
    * Cada cuánto salimos a propósito para que Railway levante un proceso nuevo.
    *
-   * Chromium pierde memoria: arranca en ~1,2 GB y trepa hasta ~2,9 GB en unos
-   * días. Como Railway factura el promedio de memoria por minuto ($10 por
-   * GB-mes), esa pendiente es plata: el promedio de 7 días daba 2,3 GB, más que
-   * TODOS los demás servicios de la cuenta juntos. Reciclar cada 24h corta la
-   * pendiente cerca del piso.
-   *
-   * No es un workaround de algo arreglable acá: la fuga está adentro de
-   * WhatsApp Web, no en este código.
+   * Esto nació como el parche de la fuga de Chromium, que costaba ~0,38 GB por
+   * día y se comía la factura. Con Baileys esa fuga no existe, así que **ya no
+   * es un arreglo: es un seguro**. Queda por 7 días para acotar cualquier
+   * deriva que no hayamos visto todavía, y porque un reinicio de este servicio
+   * es barato (reconecta desde el auth state, sin QR). Si en unos meses la
+   * memoria se ve plana, se puede sacar del todo.
    */
-  reciclarCadaMs: numero("RECICLAR_CADA_MS", 24 * 60 * 60 * 1_000),
+  reciclarCadaMs: numero("RECICLAR_CADA_MS", 7 * 24 * 60 * 60 * 1_000),
 
   /**
-   * Techo del heap de V8 en el renderer, en MB.
+   * Número de la cuenta, en formato internacional sin `+` (ej. 5491162371507).
    *
-   * Sin esto V8 crece hasta donde haya RAM — y el límite del servicio es el del
-   * plan, o sea 24 GB. Si el techo quedara corto, el renderer muere, WhatsApp
-   * se desconecta y el proceso se reinicia (mismo camino que cualquier otra
-   * desconexión); se ve como reinicios seguidos en los logs. Subirlo desde la
-   * variable, no hace falta tocar código.
+   * Si está, la vinculación va por **código** en vez de por QR: el servicio
+   * pide un código de 8 caracteres y lo publica en la misma pantalla de
+   * Clicnet. Es el camino recomendado, por dos razones medidas:
+   *
+   *  - el QR rota cada ~20s y en la práctica es difícil escanear el vigente;
+   *  - hay un bug abierto de WhatsApp/Baileys en el flujo del QR
+   *    ([#2737](https://github.com/WhiskeySockets/Baileys/issues/2737)) que el
+   *    camino del código no toca. Vincular por código está verificado con este
+   *    número; por QR, no.
+   *
+   * Si no está, se cae al QR de siempre.
    */
-  chromiumHeapMb: numero("CHROMIUM_HEAP_MB", 512),
+  numeroVinculacion: (process.env.WHATSAPP_NUMERO ?? "").replace(/[^0-9]/g, "") || null,
 
-  /**
-   * Techo de la caché de disco de Chromium, en MB. Vive en el volumen: sin tope
-   * crece para siempre y termina llenándolo.
-   */
-  chromiumCacheMb: numero("CHROMIUM_CACHE_MB", 100),
-
-  /** Dónde vive la sesión de WhatsApp. En Railway tiene que ser un volumen. */
+  /** Dónde vive el auth state. En Railway tiene que ser un volumen. */
   dataPath: process.env.DATA_PATH || "/data",
 
   version: process.env.APP_VERSION || "1.0.0",
