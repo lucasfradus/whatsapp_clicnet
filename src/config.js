@@ -64,6 +64,22 @@ export const config = {
    */
   numeroVinculacion: (process.env.WHATSAPP_NUMERO ?? "").replace(/[^0-9]/g, "") || null,
 
+  /**
+   * Auth state ya vinculado, para sembrar el volumen en el primer arranque.
+   * Es el JSON de la carpeta de sesión, gzippeado y en base64 (~10 KB).
+   *
+   * Existe porque vincular desde cero necesita **dos** cosas que no siempre
+   * están: un lugar libre en la lista de dispositivos de WhatsApp (son 4, y
+   * con la lista llena rechaza sin decir por qué) y alguien con el celular a
+   * mano en el momento justo, porque los códigos vencen al minuto. Con una
+   * sesión ya vinculada y verificada, traerla es determinístico: el servicio
+   * arranca conectado y no hay nada que vincular.
+   *
+   * Sólo se usa si el volumen NO tiene sesión. Una vez sembrado es inerte y
+   * **conviene borrar la variable**: son credenciales.
+   */
+  authSeed: process.env.BAILEYS_AUTH_SEED || null,
+
   /** Dónde vive el auth state. En Railway tiene que ser un volumen. */
   dataPath: process.env.DATA_PATH || "/data",
 

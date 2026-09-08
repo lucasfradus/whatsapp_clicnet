@@ -1,5 +1,6 @@
 import fs from "node:fs/promises"
 import path from "node:path"
+import zlib from "node:zlib"
 import QRCode from "qrcode"
 import makeWASocket, {
   useMultiFileAuthState,
@@ -88,9 +89,45 @@ export async function iniciarWhatsapp() {
   await conectar()
 }
 
+/**
+ * Escribe en el volumen un auth state ya vinculado, si no hay ninguno.
+ *
+ * Ver el comentario de `authSeed` en config.js para el porqué. Lo importante
+ * acá: **no pisa una sesión existente**. Si el volumen ya tiene `creds.json`,
+ * esta función no hace nada, así que dejar la variable puesta por olvido no
+ * puede romper una sesión que está andando.
+ */
+async function sembrarAuthState(dir) {
+  if (!config.authSeed) return
+
+  try {
+    await fs.access(path.join(dir, "creds.json"))
+    return // ya hay sesión: no tocamos nada
+  } catch {
+    /* no hay sesión: sembramos */
+  }
+
+  try {
+    const json = zlib.gunzipSync(Buffer.from(config.authSeed, "base64")).toString("utf8")
+    const archivos = JSON.parse(json)
+    let escritos = 0
+    for (const [nombre, contenido] of Object.entries(archivos)) {
+      // El nombre viene de una variable de entorno: que no se pueda escribir
+      // fuera del directorio de la sesión.
+      if (nombre.includes("/") || nombre.includes("\\") || nombre.startsWith(".")) continue
+      await fs.writeFile(path.join(dir, nombre), contenido, "utf8")
+      escritos++
+    }
+    console.log(`[whatsapp] auth state sembrado desde BAILEYS_AUTH_SEED (${escritos} archivos)`)
+  } catch (error) {
+    console.error("[whatsapp] no se pudo sembrar el auth state:", error.message)
+  }
+}
+
 async function conectar() {
   const dir = authDir()
   await fs.mkdir(dir, { recursive: true })
+  await sembrarAuthState(dir)
   const { state, saveCreds } = await useMultiFileAuthState(dir)
 
   sock = makeWASocket({
