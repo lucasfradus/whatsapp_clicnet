@@ -14,7 +14,6 @@
   },
   "dependencies": {
     "baileys": "6.7.24",
-    "qrcode": "^1.5.4",
-    "whatsapp-web.js": "^1.26.0"
+    "qrcode": "^1.5.4"
   }
 }

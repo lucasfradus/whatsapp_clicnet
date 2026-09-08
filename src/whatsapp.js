@@ -1,41 +1,80 @@
+import fs from "node:fs/promises"
 import path from "node:path"
-import pkg from "whatsapp-web.js"
 import QRCode from "qrcode"
+import makeWASocket, {
+  useMultiFileAuthState,
+  DisconnectReason,
+  Browsers,
+} from "baileys"
 import { config } from "./config.js"
 import { publicarQr } from "./clicnet.js"
-import { prepararPerfil } from "./perfil.js"
-
-const { Client, LocalAuth } = pkg
 
 /**
  * Sesión de WhatsApp Web.
  *
  * Es UNA sola para toda la cadena: el número de Clic está en los grupos de las
- * 14 sedes. La sesión vive en `dataPath`, que en Railway tiene que ser un
- * volumen — sin eso, cada deploy pide QR de nuevo.
+ * 14 sedes. El auth state vive en `dataPath`, que en Railway es un volumen —
+ * sin eso, cada deploy pide QR de nuevo.
  *
- * El servicio corre con UNA réplica. La sesión es un lock de archivo: dos
- * instancias apuntando al mismo volumen se pisan y desloguean el número.
+ * **Acá NO hay navegador.** Baileys habla el protocolo multi-device de WhatsApp
+ * directo por WebSocket. Antes esto era whatsapp-web.js, o sea un Chromium
+ * headless, y ese Chromium era el problema: perdía memoria a ~0,38 GB por día
+ * y con un piso de 836 MB era el servicio más caro de toda la cuenta de
+ * Railway. Al sacarlo se fueron de una tres cosas más:
+ *
+ *  - el volumen de 3,3 GB (el auth state son unos JSON de pocos KB), y con él
+ *    toda la familia de bugs del SingletonLock;
+ *  - `getChats()`, roto hacía meses, que dejaba el selector de destinos con
+ *    JIDs crudos. Acá los grupos salen de `groupFetchAllParticipating()`;
+ *  - el `exit(1)` en cada desconexión: sin Chromium que quede colgado,
+ *    reconectar en caliente es lo correcto.
+ *
+ * Si alguien propone volver a whatsapp-web.js, esa es la lista de lo que se
+ * vuelve a comprar.
  */
 
-let cliente = null
+let sock = null
 let conectado = false
 let numero = null
+let reconectando = false
+
+/** Baileys espera un logger tipo pino. No queremos su ruido en los logs. */
+const mudo = {
+  level: "silent",
+  child: () => mudo,
+  trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {},
+}
+
+/** Dónde vive el auth state. Son unos JSON chicos, no un perfil de navegador. */
+const authDir = () => path.join(config.dataPath, "baileys")
 
 /**
- * Grupos conocidos, por JID.
+ * Metadata de grupos, cacheada.
  *
- * Se llena por dos vías porque ninguna sola alcanza:
- *  - `getChats()`, que es la completa pero se rompe seguido (whatsapp-web.js
- *    consulta el Store interno de WhatsApp Web, y cada actualización de WhatsApp
- *    puede dejarla tirando un error minificado tipo "r").
- *  - los mensajes que llegan, que es la vía confiable: si el número está en el
- *    grupo, ve los mensajes. Alcanza con que alguien escriba una vez.
+ * No es una optimización: al mandar a un grupo Baileys necesita la lista de
+ * participantes para cifrarle a cada uno, y si no se la damos la pide a
+ * WhatsApp en CADA envío. Eso es lo que dispara rate limits y baneos — y acá
+ * TODOS los mensajes van a grupos.
  */
-const grupos = new Map()
+const CACHE_MS = 5 * 60 * 1_000
+const cacheGrupos = new Map() // jid -> { metadata, expira }
 
-/** Para loguear el fallo de getChats() una vez y no en cada latido. */
-let getChatsRoto = false
+function cachear(jid, metadata) {
+  if (metadata) cacheGrupos.set(jid, { metadata, expira: Date.now() + CACHE_MS })
+}
+
+function delCache(jid) {
+  const entrada = cacheGrupos.get(jid)
+  if (!entrada) return undefined
+  if (entrada.expira < Date.now()) {
+    cacheGrupos.delete(jid)
+    return undefined
+  }
+  return entrada.metadata
+}
+
+/** Nombres de grupo conocidos, para el selector de destinos de Clicnet. */
+const grupos = new Map() // jid -> { nombre, pista }
 
 export function estaConectado() {
   return conectado
@@ -46,153 +85,116 @@ export function numeroConectado() {
 }
 
 export async function iniciarWhatsapp() {
-  const liberado = await prepararPerfil(config.dataPath)
-  if (liberado > 0) {
-    console.log(`[perfil] caché de Chromium borrada: ${(liberado / 1024 ** 3).toFixed(2)} GB liberados`)
-  }
+  await conectar()
+}
 
-  cliente = new Client({
-    authStrategy: new LocalAuth({ dataPath: path.join(config.dataPath, "sesion") }),
-    puppeteer: {
-      headless: true,
-      // Chromium del sistema (lo instala el Dockerfile), no el que baja Puppeteer.
-      executablePath: process.env.CHROME_BIN || "/usr/bin/chromium",
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        // El /dev/shm de un contenedor es chico y Chromium se cae solo sin esto.
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
+async function conectar() {
+  const dir = authDir()
+  await fs.mkdir(dir, { recursive: true })
+  const { state, saveCreds } = await useMultiFileAuthState(dir)
 
-        // --- Memoria ---
-        // Un proceso por frame no nos sirve: WhatsApp Web es un solo origen, así
-        // que el aislamiento no compra nada y cada proceso extra cuesta RAM.
-        "--disable-features=site-per-process,TranslateUI",
-        "--renderer-process-limit=1",
-        // El techo del heap de V8. Ver el comentario de chromiumHeapMb en config.
-        `--js-flags=--max-old-space-size=${config.chromiumHeapMb}`,
-        // Cosas de navegador de escritorio que acá no se usan y cuestan RAM y red.
-        "--disable-extensions",
-        "--disable-background-networking",
-        "--disable-component-update",
-        "--disable-default-apps",
-        "--disable-sync",
-        "--no-first-run",
-        "--no-default-browser-check",
-
-        // --- Disco ---
-        // El perfil vive en el volumen; sin tope la caché crece para siempre.
-        `--disk-cache-size=${config.chromiumCacheMb * 1024 * 1024}`,
-
-        // --- NO SACAR ---
-        // Chromium apaga timers y frena las pestañas que no se ven. La nuestra
-        // NUNCA se ve (headless, sin foco), así que con el comportamiento por
-        // defecto WhatsApp Web se queda sin latir y se desconecta. Estos tres
-        // flags no ahorran memoria: evitan que el servicio se caiga solo.
-        "--disable-backgrounding-occluded-windows",
-        "--disable-renderer-backgrounding",
-        "--disable-background-timer-throttling",
-      ],
-    },
+  sock = makeWASocket({
+    auth: state,
+    browser: Browsers.ubuntu("Clic Sender"),
+    logger: mudo,
+    // No bajamos el historial: sólo mandamos. Es lo que más memoria y tiempo
+    // costaría al vincular, y no lo usamos para nada.
+    syncFullHistory: false,
+    // No marcamos el número como "en línea": es un número de la empresa, no
+    // queremos que parezca que hay alguien leyendo.
+    markOnlineOnConnect: false,
+    cachedGroupMetadata: async (jid) => delCache(jid),
   })
 
-  cliente.on("qr", async (qr) => {
+  sock.ev.on("creds.update", saveCreds)
+  sock.ev.on("connection.update", (u) => void alCambiarConexion(u))
+
+  // Los mensajes entrantes siguen sirviendo para descubrir grupos, igual que
+  // hoy. Ya no es la vía principal —groupFetchAllParticipating() anda— pero no
+  // cuesta nada tenerla de respaldo.
+  sock.ev.on("messages.upsert", ({ messages }) => {
+    for (const msg of messages ?? []) registrarGrupoDelMensaje(msg)
+  })
+
+  sock.ev.on("groups.update", async (eventos) => {
+    for (const evento of eventos ?? []) {
+      if (!evento?.id) continue
+      try {
+        cachear(evento.id, await sock.groupMetadata(evento.id))
+      } catch { /* se recupera en el próximo listarGrupos */ }
+    }
+  })
+}
+
+async function alCambiarConexion({ connection, lastDisconnect, qr }) {
+  if (qr) {
     conectado = false
     console.log("[whatsapp] QR nuevo: hay que vincular el número desde Clicnet")
     try {
-      const dataUrl = await QRCode.toDataURL(qr, { width: 512, margin: 1 })
-      await publicarQr(dataUrl)
+      await publicarQr(await QRCode.toDataURL(qr, { width: 512, margin: 1 }))
     } catch (error) {
       console.error("[whatsapp] no se pudo publicar el QR:", error.message)
     }
-  })
+    return
+  }
 
-  cliente.on("ready", () => {
+  if (connection === "open") {
     conectado = true
-    numero = cliente.info?.wid?.user ?? null
+    reconectando = false
+    numero = sock.user?.id?.split(":")[0]?.split("@")[0] ?? null
     console.log(`[whatsapp] listo, conectado como ${numero}`)
-  })
+    return
+  }
 
-  cliente.on("authenticated", () => {
-    console.log("[whatsapp] sesión autenticada")
-  })
+  if (connection !== "close") return
 
-  // Cualquier mensaje de un grupo nos da su JID. `message_create` incluye los
-  // propios, así que escribir en el grupo desde el mismo celular también sirve.
-  cliente.on("message_create", (msg) => void registrarGrupoDelMensaje(msg))
-  cliente.on("message", (msg) => void registrarGrupoDelMensaje(msg))
+  conectado = false
+  numero = null
+  const codigo = lastDisconnect?.error?.output?.statusCode
 
-  cliente.on("auth_failure", (mensaje) => {
-    conectado = false
-    console.error("[whatsapp] falló la autenticación:", mensaje)
-  })
+  // Sesión cerrada desde el celular: las credenciales ya no sirven. Hay que
+  // borrarlas, si no cada reintento falla igual y quedamos en un loop de
+  // reinicios (con restartPolicy ALWAYS, para siempre). Borrándolas, el
+  // reconnect emite un QR nuevo y alguien lo escanea desde Clicnet.
+  if (codigo === DisconnectReason.loggedOut) {
+    console.error("[whatsapp] sesión cerrada desde el celular; hace falta escanear el QR de nuevo")
+    await fs.rm(authDir(), { recursive: true, force: true }).catch(() => {})
+  } else {
+    console.error(`[whatsapp] desconectado (${codigo ?? "sin código"}), reconectando`)
+  }
 
-  cliente.on("disconnected", (motivo) => {
-    conectado = false
-    numero = null
-    console.error("[whatsapp] desconectado:", motivo)
-    // No reconectamos a mano: salimos y que Railway reinicie el contenedor.
-    // Reconectar en caliente con whatsapp-web.js deja el Chromium colgado.
-    process.exit(1)
-  })
-
-  await cliente.initialize()
+  // A diferencia de whatsapp-web.js, acá reconectar en caliente es lo correcto:
+  // no hay Chromium que pueda quedar colgado, es un WebSocket. Por eso ya no
+  // salimos con exit(1) en cada desconexión — que era, además, lo que gastaba
+  // el presupuesto de reinicios de Railway.
+  if (reconectando) return
+  reconectando = true
+  setTimeout(() => {
+    conectar().catch((error) => {
+      console.error("[whatsapp] no se pudo reconectar:", error.message)
+      process.exit(1) // que Railway levante uno limpio
+    })
+  }, 3_000)
 }
 
 /** Manda un mensaje. Tira si falla, para que el loop lo reporte como error. */
 export async function mandarMensaje(chatId, texto) {
-  if (!cliente || !conectado) throw new Error("WhatsApp no está conectado")
-  await cliente.sendMessage(chatId, texto)
+  if (!sock || !conectado) throw new Error("WhatsApp no está conectado")
+  await sock.sendMessage(chatId, { text: texto })
 }
 
-/**
- * Intenta el nombre real del grupo por las tres vías que expone la librería.
- * Todas pegan contra el mismo Store de WhatsApp Web, así que suelen romperse
- * juntas — pero cuando WhatsApp lo arregle, esto empieza a andar solo.
- */
-async function nombreDelGrupo(msg, jid) {
+function registrarGrupoDelMensaje(msg) {
   try {
-    const chat = await msg.getChat()
-    if (chat?.name) return chat.name
-    // groupMetadata.subject es el nombre "crudo" del grupo: a veces está
-    // aunque `name` venga vacío.
-    if (chat?.groupMetadata?.subject) return chat.groupMetadata.subject
-  } catch { /* seguimos probando */ }
-
-  try {
-    const chat = await cliente.getChatById(jid)
-    if (chat?.name) return chat.name
-    if (chat?.groupMetadata?.subject) return chat.groupMetadata.subject
-  } catch { /* nos quedamos sin nombre */ }
-
-  return null
-}
-
-/**
- * Anota el grupo del que vino un mensaje. Nunca tira: es un side effect.
- *
- * Además del nombre (que puede no venir), guarda una PISTA: qué se escribió y
- * quién. Es lo que hace usable el selector cuando WhatsApp no da los nombres —
- * seis "1203636...@g.us" son indistinguibles, pero "«tortugas» — Lucas" no.
- * Se actualiza con cada mensaje: escribir en el grupo alcanza para reconocerlo.
- */
-async function registrarGrupoDelMensaje(msg) {
-  try {
-    const jid = msg?.from ?? ""
+    const jid = msg?.key?.remoteJid ?? ""
     if (!jid.endsWith("@g.us")) return
 
     const previo = grupos.get(jid)
-    const nombre = previo?.nombre ?? (await nombreDelGrupo(msg, jid))
-
-    const cuerpo = (msg?.body ?? "").trim().replace(/\s+/g, " ").slice(0, 40)
-    const quien = msg?._data?.notifyName ?? null
+    const cuerpo = (msg?.message?.conversation ?? msg?.message?.extendedTextMessage?.text ?? "")
+      .trim().replace(/\s+/g, " ").slice(0, 40)
+    const quien = msg?.pushName ?? null
     const pista = cuerpo ? (quien ? `«${cuerpo}» — ${quien}` : `«${cuerpo}»`) : (previo?.pista ?? null)
 
-    grupos.set(jid, { nombre, pista })
-
-    if (!previo) {
-      console.log(`[whatsapp] grupo descubierto: ${nombre ?? jid}${pista ? ` · ${pista}` : ""}`)
-    }
+    grupos.set(jid, { nombre: previo?.nombre ?? null, pista })
   } catch (error) {
     console.error("[whatsapp] no se pudo registrar el grupo:", error.message)
   }
@@ -201,37 +203,22 @@ async function registrarGrupoDelMensaje(msg) {
 /**
  * Grupos donde está el número, para que Clicnet arme el selector de destinos.
  *
- * Intenta `getChats()` y suma lo que haya visto por mensajes. Si `getChats()`
- * falla —pasa seguido— igual devolvemos los descubiertos, que para el caso de
- * uso alcanzan: son los grupos donde alguien ya escribió.
+ * Con whatsapp-web.js esto dependía de getChats(), que lleva meses roto y
+ * dejaba el selector con JIDs crudos. Baileys tiene la API posta, así que acá
+ * los nombres vuelven a salir.
  */
 export async function listarGrupos() {
-  if (!cliente || !conectado) return []
+  if (!sock || !conectado) return []
 
   try {
-    const chats = await cliente.getChats()
-    for (const chat of chats) {
-      if (!chat.isGroup) continue
-      const jid = chat.id._serialized
+    const todos = await sock.groupFetchAllParticipating()
+    for (const [jid, metadata] of Object.entries(todos ?? {})) {
+      cachear(jid, metadata)
       const previo = grupos.get(jid)
-      grupos.set(jid, { nombre: chat.name ?? previo?.nombre ?? null, pista: previo?.pista ?? null })
-    }
-    if (getChatsRoto) {
-      console.log("[whatsapp] getChats() volvió a funcionar")
-      getChatsRoto = false
+      grupos.set(jid, { nombre: metadata?.subject ?? previo?.nombre ?? null, pista: previo?.pista ?? null })
     }
   } catch (error) {
-    // Una vez y no en cada latido: esto falla cada 60s durante meses, y un log
-    // que siempre tiene el mismo error es un log que nadie mira. El stack va
-    // completo porque el `message` viene minificado ("r") y no dice nada.
-    if (!getChatsRoto) {
-      getChatsRoto = true
-      console.error(
-        "[whatsapp] getChats() falló; de acá en más los grupos salen sólo de los mensajes recibidos. " +
-          "No se vuelve a loguear hasta que funcione:",
-        error.stack ?? error
-      )
-    }
+    console.error("[whatsapp] groupFetchAllParticipating() falló:", error.message)
   }
 
   return [...grupos].map(([id, { nombre, pista }]) => ({ id, nombre: nombre ?? id, pista }))

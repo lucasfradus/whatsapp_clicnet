@@ -30,8 +30,9 @@ const arrancadoEn = Date.now()
 /**
  * Sale del proceso cada tanto para que Railway levante uno nuevo.
  *
- * Chromium pierde memoria y Railway factura el promedio por minuto, así que un
- * proceso viejo es literalmente más caro que uno nuevo. Salimos con 0: es una
+ * Nació como el parche de la fuga de Chromium; con Baileys esa fuga no existe,
+ * así que ahora es un **seguro** contra una deriva que no hayamos visto, no un
+ * arreglo. Por eso el intervalo pasó de 24h a 7 días. Salimos con 0: es una
  * terminación buscada, no un fallo, y el `restartPolicyType: ALWAYS` del
  * railway.json es lo que hace que Railway lo levante igual.
  *
