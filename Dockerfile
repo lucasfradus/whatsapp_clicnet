@@ -1,18 +1,22 @@
-# Sin navegador. Baileys habla el protocolo de WhatsApp por WebSocket, así que
-# esto es un servicio Node y nada más.
-#
-# Antes acá se instalaba Chromium por apt para whatsapp-web.js: 666 MB de imagen
-# y un proceso que perdía memoria a ~0,38 GB por día. Si alguien vuelve a
-# necesitar un navegador acá, conviene releer por qué se fue.
+# Chromium propio del sistema: el que baja Puppeteer no corre en Alpine ni en
+# la imagen slim, y bajarlo en cada build son 150MB al pedo.
 FROM node:20-slim
 
-ENV NODE_ENV=production \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    fonts-liberation \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
+    CHROME_BIN=/usr/bin/chromium \
+    NODE_ENV=production \
     DATA_PATH=/data
 
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev
+RUN npm install --omit=dev
 
 COPY src ./src
 
