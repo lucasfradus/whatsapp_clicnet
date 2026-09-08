@@ -49,6 +49,7 @@ los mensajes quedan `PENDIENTE` y salen cuando vuelve. Por eso el sender
 | `HEARTBEAT_INTERVAL_MS` | no | `60000` | Cada cuánto reporta que está vivo |
 | `DELAY_ENVIO_MS` | no | `4000` | Espera entre mensajes. **No bajar sin pensarlo** |
 | `WHATSAPP_NUMERO` | no | — | Número de la cuenta sin `+` (ej. `5491162371507`). Si está, vincula por **código** en vez de QR |
+| `BAILEYS_AUTH_SEED` | no | — | Sesión ya vinculada (gzip + base64) para sembrar un volumen vacío. **Son credenciales: borrar después de usar** |
 | `RECICLAR_CADA_MS` | no | `604800000` | Cada cuánto sale a propósito. Seguro, no arreglo — ver abajo |
 | `PORT` | no | `3000` | Healthcheck en `/health` |
 
